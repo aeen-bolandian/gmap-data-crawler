@@ -4,6 +4,21 @@ src/resolver.py
 Phase 1 — Location Resolver Pipeline.
 
 Builds the most accurate Google Maps URL for each establishment.
+
+Query strategy
+--------------
+Google Maps' `?q=` searches on keywords. Adding `neighborhood + city`
+to the cafe name works when the neighborhood is unique, but many cafes
+share a name across branches (e.g. "Gennaro" has Zafaranieh and
+Marzdaran branches) and the DB's `neighborhood` column is sometimes
+coarser than the Google-formatted `search_address`.
+
+We therefore prefer `search_address` (a rich, Google-formatted
+address) when it is available, and fall back to
+`neighborhood + city` when it is not. `_short_address()` picks the
+last 3 meaningful parts of `search_address` so the query stays focused
+(e.g. "بلوار مرزداران اطاعتی جنوبی نسترن" instead of the full
+"ایران، تهران، شهر تهران، ...").
 """
 
 from __future__ import annotations
@@ -32,6 +47,58 @@ class ResolvedTarget:
     strategy: ResolverStrategy
 
 
+# Tokens that mark a part as noise (country/city duplicates) when we
+# extract from `search_address`.
+_NOISE_TOKENS = ("ایران", "تهران", "شهر تهران", "استان تهران", "شهر")
+
+# Tokens that mark a part as meaningful (used to keep the tail of the
+# address).
+_MEANINGFUL_PREFIXES = (
+    "منطقه", "منطقه‌", "شهرک", "محله", "خیابان", "بلوار", "کوچه",
+    "میدان", "بزرگراه", "اتوبان", "باغ", "پارک",
+)
+
+
+def _short_address(search_address: str, keep_tail: int = 3) -> str:
+    """
+    Extract the last `keep_tail` meaningful parts of a Google-formatted
+    address and join them with spaces.
+
+    Example
+    -------
+    >>> _short_address(
+    ...     "ایران، تهران، شهر تهران، تهران، منطقه2 شهر تهران، "
+    ...     "شهرک آزمایش، بلوار مرزداران، اطاعتی جنوبی، نسترن"
+    ... )
+    'بلوار مرزداران اطاعتی جنوبی نسترن'
+    """
+    if not search_address:
+        return ""
+
+    parts = [p.strip() for p in search_address.split("،") if p.strip()]
+    meaningful: list[str] = []
+    for p in parts:
+        # Skip pure-noise tokens.
+        if p in _NOISE_TOKENS:
+            continue
+        # Skip "شهر تهران" variants (contain city name and no meaningful prefix).
+        if p.startswith(("شهر ", "استان ")) and "تهران" in p:
+            continue
+        meaningful.append(p)
+
+    # Also strip "منطقه N شهر تهران" into just "منطقه N".
+    cleaned: list[str] = []
+    for p in meaningful:
+        if p.startswith("منطقه") and "شهر تهران" in p:
+            cleaned.append(p.split("شهر تهران")[0].strip())
+        else:
+            cleaned.append(p)
+
+    # Keep only the trailing N parts — the head is usually administrative.
+    tail = cleaned[-keep_tail:] if len(cleaned) > keep_tail else cleaned
+    return " ".join(tail)
+
+
 class LocationResolver:
     """
     Converts CafeRecord -> ResolvedTarget (Google Maps URL).
@@ -44,6 +111,8 @@ class LocationResolver:
     - `hl=en` is forced so scrapers don't depend on the user's UI language.
     - Coordinates are only appended when present; the map still centers on
       the search result otherwise.
+    - The query is built from `name + short_address` when `search_address`
+      is available, and `name + neighborhood + city` otherwise.
     """
 
     MAPS_BASE = "https://www.google.com/maps"
@@ -63,9 +132,29 @@ class LocationResolver:
 
     # ----------------------------- Internals -----------------------------
     def _build_query(self, cafe: CafeRecord) -> str:
+        """
+        Build the Google Maps `?q=` query string.
+
+        Preference order:
+        1. name + short_address (from search_address)
+        2. name + neighborhood + city (fallback)
+        """
         clean_name = cafe.name.replace("(", " ").replace(")", " ").strip()
+
+        short_addr = _short_address(cafe.search_address or "")
+        if short_addr:
+            query = f"{clean_name} {short_addr}".strip()
+            logger.debug(
+                f"[{cafe.id}] Query (search_address): {query!r}"
+            )
+            return query
+
         parts = [clean_name, cafe.neighborhood, cafe.city]
-        return " ".join(p for p in parts if p)
+        query = " ".join(p for p in parts if p)
+        logger.debug(
+            f"[{cafe.id}] Query (fallback name+neighborhood+city): {query!r}"
+        )
+        return query
 
     def _build_url(self, query: str, cafe: CafeRecord) -> str:
         encoded = quote_plus(query)
