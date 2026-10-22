@@ -6,14 +6,20 @@ Main CLI entrypoint for the gmaps-review-crawler pipeline.
 Orchestrates:
     1. Loading state (processed IDs) from crawler_state.json
     2. Iterating over unresolved cafes from SQLite
-    3. Running Phase 1 (resolver) + Phase 2 (scraper)
-    4. Streaming output via CSVExporter
-    5. Atomically checkpointing state after each cafe
+    3. Running Phase 1 (resolver) + Phase 2 (scraper) concurrently
+    4. Streaming output via CSVExporter (thread-safe, append-only)
+    5. Atomically checkpointing state after each successful cafe
+
+IMPORTANT
+---------
+Before running with --workers N, open N Maps tabs in the debug
+Chrome (e.g. `google.com/maps`). In a CDP session, tabs created via
+Playwright do NOT inherit the debug session and often load blank.
 
 Usage
 -----
 $ python run.py --db cafes_cafe.db --output data/google_reviews.csv
-$ python run.py --limit 50 --headful    # debug mode
+$ python run.py --limit 50 --workers 4 --headful
 $ python run.py --limit 2 --cdp-url http://localhost:9222
 """
 
@@ -26,6 +32,7 @@ import os
 import random
 import sys
 from pathlib import Path
+from typing import Optional
 
 from loguru import logger
 from tqdm.asyncio import tqdm_asyncio
@@ -33,20 +40,30 @@ from tqdm.asyncio import tqdm_asyncio
 from src.db_loader import DatabaseLoader, CafeRecord
 from src.exporter import CSVExporter
 from src.resolver import LocationResolver, ResolvedTarget
-from src.scraper import GoogleMapsScraper
+from src.scraper import GoogleMapsScraper, ScraperWorker
 
 
 # ---------------------------------------------------------------------------
-# State Manager (Checkpointing)
+# State Manager (Checkpointing, concurrency-safe)
 # ---------------------------------------------------------------------------
 class StateManager:
-    """Persists processed cafe IDs for crash-safe resumption."""
+    """
+    Persists processed cafe IDs for crash-safe resumption.
+
+    Thread-safe across asyncio workers via asyncio.Lock. Writes are
+    batched (FLUSH_EVERY) so we don't rewrite the JSON file 800 times
+    for 800 cafes.
+    """
+
+    FLUSH_EVERY = 10
 
     def __init__(
         self, state_path: str | Path = "crawler_state.json"
     ) -> None:
         self.state_path = Path(state_path)
         self.processed: set[int] = self._load()
+        self._dirty = 0
+        self._lock = asyncio.Lock()
 
     def _load(self) -> set[int]:
         if not self.state_path.exists():
@@ -60,27 +77,49 @@ class StateManager:
             logger.warning("Corrupt state file — starting fresh.")
             return set()
 
-    def mark_processed(self, cafe_id: int) -> None:
-        self.processed.add(cafe_id)
-        self._save()
+    async def mark_processed(self, cafe_id: int) -> None:
+        async with self._lock:
+            self.processed.add(cafe_id)
+            self._dirty += 1
+            if self._dirty >= self.FLUSH_EVERY:
+                self._save()
+                self._dirty = 0
+
+    async def flush(self) -> None:
+        async with self._lock:
+            if self._dirty > 0 or not self.state_path.exists():
+                self._save()
+                self._dirty = 0
 
     def _save(self) -> None:
         tmp = self.state_path.with_suffix(".tmp")
         payload = {"processed_ids": sorted(self.processed)}
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        os.replace(tmp, self.state_path)  # atomic on POSIX & Windows
+        os.replace(tmp, self.state_path)
 
     def is_processed(self, cafe_id: int) -> bool:
         return cafe_id in self.processed
 
 
 # ---------------------------------------------------------------------------
-# Pipeline Orchestrator
+# Concurrent Pipeline
 # ---------------------------------------------------------------------------
-class CrawlerPipeline:
-    # Jitter between cafes to look human and avoid rate-limit bans.
-    MIN_DELAY = 3.0
-    MAX_DELAY = 8.0
+class ConcurrentPipeline:
+    """
+    Worker pool sharing an asyncio.Queue of cafes.
+
+    Each worker owns one tab (ScraperWorker) and processes cafes one
+    at a time. Exporter and StateManager are shared across workers and
+    are internally synchronized.
+    """
+
+    # Small jitter between cafes within the same worker. Prevents all
+    # workers from hitting Google at exactly the same rate.
+    MIN_DELAY = 0.5
+    MAX_DELAY = 1.5
+
+    # On transient failure, reset the tab and retry once.
+    MAX_ATTEMPTS = 2
 
     def __init__(
         self,
@@ -88,84 +127,130 @@ class CrawlerPipeline:
         scraper: GoogleMapsScraper,
         exporter: CSVExporter,
         state: StateManager,
-        resolver: LocationResolver | None = None,
+        workers: int = 4,
+        resolver: Optional[LocationResolver] = None,
     ) -> None:
         self.loader = loader
         self.scraper = scraper
         self.exporter = exporter
         self.state = state
+        self.workers = workers
         self.resolver = resolver or LocationResolver()
 
-    async def run(self, limit: int | None = None) -> None:
-        # Collect pending cafes in one pass.
+    async def run(self, limit: Optional[int] = None) -> None:
         pending: list[CafeRecord] = [
             cafe
             for cafe in self.loader.iter_cafes(approved_only=True)
             if not self.state.is_processed(cafe.id)
         ]
-
         if limit:
             pending = pending[:limit]
 
         total = len(pending)
-        logger.info(f"Pending cafes to crawl: {total}")
-
+        logger.info(
+            f"Pending cafes to crawl: {total} "
+            f"(workers={self.workers})"
+        )
         if total == 0:
-            logger.success(
-                "Nothing to do — all records already processed."
-            )
+            logger.success("Nothing to do.")
             return
+
+        queue: asyncio.Queue[CafeRecord] = asyncio.Queue()
+        for cafe in pending:
+            queue.put_nowait(cafe)
 
         progress = tqdm_asyncio(
             total=total, desc="Crawling", unit="cafe"
         )
         try:
-            for idx, cafe in enumerate(pending):
-                progress.set_postfix_str(
-                    f"id={cafe.id} · {cafe.name[:30]}"
-                )
-                try:
-                    ok = await self._process_one(cafe)
-                    if not ok:
-                        logger.warning(
-                            f"[{cafe.id}] No reviews extracted — "
-                            f"NOT checkpointed, will retry on next run."
-                        )
-                except Exception as exc:  # noqa: BLE001
-                    logger.exception(
-                        f"[{cafe.id}] Pipeline failure: {exc}"
-                    )
-                finally:
-                    progress.update(1)
-
-                # Inter-cafe jitter (skip after the last one).
-                if idx < total - 1:
-                    delay = random.uniform(
-                        self.MIN_DELAY, self.MAX_DELAY
-                    )
-                    logger.debug(
-                        f"Sleeping {delay:.1f}s before next cafe."
-                    )
-                    await asyncio.sleep(delay)
+            await asyncio.gather(
+                *[
+                    self._worker(i, queue, progress)
+                    for i in range(self.workers)
+                ]
+            )
         finally:
             progress.close()
+            await self.state.flush()
 
-    async def _process_one(self, cafe: CafeRecord) -> bool:
-        """Returns True if the cafe was successfully processed."""
-        target: ResolvedTarget = self.resolver.resolve(cafe)
-        reviews = await self.scraper.scrape(target)
-
-        if not reviews:
-            # Could be a transient failure or a genuinely review-less
-            # place. We do NOT checkpoint so it will be retried.
-            return False
-
-        written = await self.exporter.append_many(reviews)
-        self.state.mark_processed(cafe.id)
-        logger.debug(
-            f"[{cafe.id}] checkpoint saved (rows={written})."
+    # ------------------------------------------------------------------
+    # Worker
+    # ------------------------------------------------------------------
+    async def _worker(
+        self,
+        worker_id: int,
+        queue: asyncio.Queue,
+        progress,
+    ) -> None:
+        worker_scraper = ScraperWorker(
+            self.scraper.context,
+            worker_id,
+            self.scraper.page_pool,
         )
-        return True
+        try:
+            while True:
+                try:
+                    cafe = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+
+                try:
+                    await self._process_one(
+                        worker_scraper, worker_id, cafe, progress
+                    )
+                finally:
+                    queue.task_done()
+
+                await asyncio.sleep(
+                    random.uniform(self.MIN_DELAY, self.MAX_DELAY)
+                )
+        finally:
+            await worker_scraper.close()
+            logger.debug(f"[w{worker_id}] Worker shutting down.")
+
+    async def _process_one(
+        self,
+        worker_scraper: ScraperWorker,
+        worker_id: int,
+        cafe: CafeRecord,
+        progress,
+    ) -> None:
+        progress.set_postfix_str(
+            f"w{worker_id} id={cafe.id} · {cafe.name[:25]}"
+        )
+
+        target: ResolvedTarget = self.resolver.resolve(cafe)
+
+        for attempt in range(1, self.MAX_ATTEMPTS + 1):
+            try:
+                reviews = await worker_scraper.scrape(target)
+                if reviews:
+                    await self.exporter.append_many(reviews)
+                    await self.state.mark_processed(cafe.id)
+                    logger.debug(
+                        f"[w{worker_id}][{cafe.id}] checkpoint saved "
+                        f"(rows={len(reviews)})."
+                    )
+                else:
+                    logger.warning(
+                        f"[w{worker_id}][{cafe.id}] No reviews extracted "
+                        f"— NOT checkpointed, will retry on next run."
+                    )
+                return
+            except Exception as exc:
+                logger.exception(
+                    f"[w{worker_id}][{cafe.id}] attempt {attempt} "
+                    f"failed: {exc}"
+                )
+                if attempt < self.MAX_ATTEMPTS:
+                    await worker_scraper.reset_page()
+                    await asyncio.sleep(1.0)
+                else:
+                    logger.error(
+                        f"[w{worker_id}][{cafe.id}] giving up after "
+                        f"{self.MAX_ATTEMPTS} attempts."
+                    )
+        progress.update(1)
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +276,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--limit", type=int, default=None,
         help="Max cafes to process.",
+    )
+    p.add_argument(
+        "--workers", type=int, default=4,
+        help=(
+            "Number of concurrent tabs (default: 4). "
+            "Open this many Maps tabs in your debug Chrome first."
+        ),
     )
     p.add_argument(
         "--headful", action="store_true",
@@ -228,6 +320,9 @@ def _configure_logging(level: str) -> None:
 
 
 async def _main_async(args: argparse.Namespace) -> None:
+    if args.workers < 1:
+        raise SystemExit("--workers must be >= 1")
+
     with DatabaseLoader(args.db) as loader:
         exporter = CSVExporter(args.output)
         state = StateManager(args.state)
@@ -236,8 +331,19 @@ async def _main_async(args: argparse.Namespace) -> None:
             headless=not args.headful,
             cdp_url=args.cdp_url,
         ) as scraper:
-            pipeline = CrawlerPipeline(
-                loader, scraper, exporter, state
+            if scraper.page_pool.qsize() < args.workers:
+                logger.warning(
+                    f"Only {scraper.page_pool.qsize()} Maps tab(s) "
+                    f"available, but --workers={args.workers}. "
+                    f"Some workers will create new (possibly blank) "
+                    f"tabs. Open more Maps tabs in Chrome first."
+                )
+            pipeline = ConcurrentPipeline(
+                loader=loader,
+                scraper=scraper,
+                exporter=exporter,
+                state=state,
+                workers=args.workers,
             )
             await pipeline.run(limit=args.limit)
 
