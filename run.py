@@ -3,19 +3,6 @@ run.py
 ======
 Main CLI entrypoint for the gmaps-review-crawler pipeline.
 
-Orchestrates:
-    1. Loading state (processed IDs) from crawler_state.json
-    2. Iterating over unresolved cafes from SQLite
-    3. Running Phase 1 (resolver) + Phase 2 (scraper) concurrently
-    4. Streaming output via CSVExporter (thread-safe, append-only)
-    5. Atomically checkpointing state after each successful cafe
-
-IMPORTANT
----------
-Before running with --workers N, open N Maps tabs in the debug
-Chrome (e.g. `google.com/maps`). In a CDP session, tabs created via
-Playwright do NOT inherit the debug session and often load blank.
-
 Usage
 -----
 $ python run.py --db cafes_cafe.db --output data/google_reviews.csv
@@ -44,22 +31,12 @@ from src.scraper import GoogleMapsScraper, ScraperWorker
 
 
 # ---------------------------------------------------------------------------
-# State Manager (Checkpointing, concurrency-safe)
+# State Manager
 # ---------------------------------------------------------------------------
 class StateManager:
-    """
-    Persists processed cafe IDs for crash-safe resumption.
-
-    Thread-safe across asyncio workers via asyncio.Lock. Writes are
-    batched (FLUSH_EVERY) so we don't rewrite the JSON file 800 times
-    for 800 cafes.
-    """
-
     FLUSH_EVERY = 10
 
-    def __init__(
-        self, state_path: str | Path = "crawler_state.json"
-    ) -> None:
+    def __init__(self, state_path: str | Path = "crawler_state.json") -> None:
         self.state_path = Path(state_path)
         self.processed: set[int] = self._load()
         self._dirty = 0
@@ -69,9 +46,7 @@ class StateManager:
         if not self.state_path.exists():
             return set()
         try:
-            data = json.loads(
-                self.state_path.read_text(encoding="utf-8")
-            )
+            data = json.loads(self.state_path.read_text(encoding="utf-8"))
             return set(data.get("processed_ids", []))
         except json.JSONDecodeError:
             logger.warning("Corrupt state file — starting fresh.")
@@ -113,12 +88,14 @@ class ConcurrentPipeline:
     are internally synchronized.
     """
 
-    # Small jitter between cafes within the same worker. Prevents all
-    # workers from hitting Google at exactly the same rate.
-    MIN_DELAY = 0.5
-    MAX_DELAY = 1.5
+    # Inter-cafe delay within each worker. Raised from 0.5-1.5s to
+    # 3-8s after observing that repeated runs with the old settings
+    # triggered Google's rate limiter (success rate dropped from 78%
+    # to 54% over three back-to-back benchmarks). The longer delay
+    # mimics human browsing and keeps the IP out of the "sorry" page.
+    MIN_DELAY = 3.0
+    MAX_DELAY = 8.0
 
-    # On transient failure, reset the tab and retry once.
     MAX_ATTEMPTS = 2
 
     def __init__(
@@ -173,9 +150,6 @@ class ConcurrentPipeline:
             progress.close()
             await self.state.flush()
 
-    # ------------------------------------------------------------------
-    # Worker
-    # ------------------------------------------------------------------
     async def _worker(
         self,
         worker_id: int,
@@ -244,7 +218,7 @@ class ConcurrentPipeline:
                 )
                 if attempt < self.MAX_ATTEMPTS:
                     await worker_scraper.reset_page()
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(5.0)
                 else:
                     logger.error(
                         f"[w{worker_id}][{cafe.id}] giving up after "
@@ -261,22 +235,10 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="gmaps-review-crawler",
         description="Google Maps review crawler (async, resumable).",
     )
-    p.add_argument(
-        "--db", default="cafes_cafe.db",
-        help="Path to SQLite database.",
-    )
-    p.add_argument(
-        "--output", default="data/google_reviews.csv",
-        help="Output CSV path.",
-    )
-    p.add_argument(
-        "--state", default="crawler_state.json",
-        help="Checkpoint state file.",
-    )
-    p.add_argument(
-        "--limit", type=int, default=None,
-        help="Max cafes to process.",
-    )
+    p.add_argument("--db", default="cafes_cafe.db")
+    p.add_argument("--output", default="data/google_reviews.csv")
+    p.add_argument("--state", default="crawler_state.json")
+    p.add_argument("--limit", type=int, default=None)
     p.add_argument(
         "--workers", type=int, default=4,
         help=(
@@ -284,14 +246,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "Open this many Maps tabs in your debug Chrome first."
         ),
     )
-    p.add_argument(
-        "--headful", action="store_true",
-        help="Show browser window (only used if CDP fails).",
-    )
-    p.add_argument(
-        "--cdp-url", default="http://localhost:9222",
-        help="CDP endpoint of a running Chrome instance.",
-    )
+    p.add_argument("--headful", action="store_true")
+    p.add_argument("--cdp-url", default="http://localhost:9222")
     p.add_argument(
         "--log-level", default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
