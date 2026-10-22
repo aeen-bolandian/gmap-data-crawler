@@ -37,6 +37,7 @@ class CafeRecord:
     latitude: Optional[float]
     longitude: Optional[float]
     phone: Optional[str]
+    search_address: Optional[str] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -71,6 +72,9 @@ class DatabaseLoader:
         "id", "name", "address", "city", "neighborhood",
         "latitude", "longitude", "phone",
     )
+
+    # Optional columns — read if present, default to None otherwise.
+    OPTIONAL_COLUMNS = ("search_address", "search_name", "search_city")
 
     # Approval filtering — adjust APPROVAL_VALUE if your DB stores a
     # different string (e.g. "APPROVED", "1", "Approved").
@@ -175,6 +179,17 @@ class DatabaseLoader:
             logger.debug(f"Approval precheck OK — {count} approved rows.")
 
     # ----------------------------- Queries -------------------------------
+    def _select_columns(self) -> str:
+        """Build the SELECT list including optional columns if present."""
+        cols = [
+            "id", "name", "address", "city", "neighborhood",
+            "latitude", "longitude", "phone",
+        ]
+        for opt in self.OPTIONAL_COLUMNS:
+            if opt in (self._cached_columns or set()):
+                cols.append(opt)
+        return ", ".join(cols)
+
     def iter_cafes(self, approved_only: bool = True) -> Iterator[CafeRecord]:
         """
         Yield cafe records as `CafeRecord` objects (streamed, not buffered).
@@ -192,8 +207,7 @@ class DatabaseLoader:
             params = (self.APPROVAL_VALUE,)
 
         query = f"""
-            SELECT id, name, address, city, neighborhood,
-                   latitude, longitude, phone
+            SELECT {self._select_columns()}
             FROM {self.TABLE_NAME}
             {where_clause}
             ORDER BY id ASC;
@@ -211,7 +225,8 @@ class DatabaseLoader:
         assert self._connection is not None
         cursor = self._connection.cursor()
         cursor.execute(
-            f"SELECT * FROM {self.TABLE_NAME} WHERE id = ?;", (cafe_id,)
+            f"SELECT {self._select_columns()} FROM {self.TABLE_NAME} WHERE id = ?;",
+            (cafe_id,),
         )
         row = cursor.fetchone()
         return self._row_to_record(row) if row else None
@@ -232,6 +247,13 @@ class DatabaseLoader:
             # 0.0 is a legitimate coordinate — use `is not None`, not truthiness.
             return float(val) if val is not None and val != "" else None
 
+        def _get_optional(key: str):
+            """Safely read an optional column if it exists in the row."""
+            try:
+                return row[key]
+            except (IndexError, KeyError):
+                return None
+
         return CafeRecord(
             id=int(row["id"]),
             name=(row["name"] or "").strip(),
@@ -241,4 +263,5 @@ class DatabaseLoader:
             latitude=_clean_float(row["latitude"]),
             longitude=_clean_float(row["longitude"]),
             phone=_clean_str(row["phone"]),
+            search_address=_clean_str(_get_optional("search_address")),
         )
