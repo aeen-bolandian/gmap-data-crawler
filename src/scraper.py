@@ -64,8 +64,13 @@ class ReviewRecord:
 # ---------------------------------------------------------------------------
 class GoogleMapsScraper:
     # --- Selectors ---------------------------------------------------------
-    # `data-review-id` is the most stable anchor Google exposes.
-    SEL_REVIEW_ITEM = "div.jftiEf, div[data-review-id]"
+    # `jftiEf` is the *card* class. `data-review-id` is set on both the
+    # card and (sometimes) an outer wrapper, so matching on both with a
+    # comma-selector double-counts every review. Use `jftiEf` first and
+    # only fall back to `data-review-id` when no card is found at all.
+    SEL_REVIEW_ITEM = "div.jftiEf"
+    SEL_REVIEW_ITEM_FALLBACK = "div[data-review-id]"
+
     SEL_MORE_BUTTON = (
         'button.w8nwRe.kyuRq, '
         'button[aria-label*="More" i], '
@@ -84,6 +89,22 @@ class GoogleMapsScraper:
     # Text: scoped to the visible review body.
     SEL_TEXT = "span.wiI7pd"
 
+    # --- Place-page detection --------------------------------------------
+    # A "real" place page always has an <h1> and a Reviews tab. The
+    # preview cards that appear before opening the Reviews tab also
+    # match SEL_REVIEW_ITEM, so we cannot use that alone to decide
+    # whether the place page is ready.
+    SEL_PLACE_H1 = "h1"
+    SEL_PLACE_TAB = 'button[role="tab"]'
+    SEL_REVIEWS_TAB = (
+        'button[role="tab"]:has-text("Reviews"), '
+        'button[role="tab"]:has-text("نظرات"), '
+        'button[aria-label*="Reviews for" i], '
+        'button[aria-label*="نظرات" i]'
+    )
+    SEL_FEED = 'div[role="feed"]'
+    SEL_FIRST_RESULT = 'div[role="feed"] a[href*="/maps/place/"], a.hfpxzc'
+
     # --- Timing configuration -------------------------------------------
     # Centralized here so later perf optimizations only touch numbers,
     # not control flow. Values match the v1.0.0 hardcoded defaults.
@@ -91,6 +112,7 @@ class GoogleMapsScraper:
     POST_GOTO_SETTLE_MS = 5_000
     POST_TAB_CLICK_SETTLE_MS = 2_000
     POST_FIRST_RESULT_SETTLE_MS = 3_000
+    POST_MORE_EXPAND_SETTLE_MS = 300
     SIGNAL_POLL_INTERVAL_MS = 1_000
     SIGNAL_POLL_MAX_ATTEMPTS = 20
     SCROLL_STEP_PX = 3_000
@@ -317,96 +339,160 @@ class GoogleMapsScraper:
     async def _open_reviews_tab(
         self, page: Page, cafe: CafeRecord
     ) -> bool:
-        # Quick exit: if we already have review cards, we're done.
-        if await page.locator(self.SEL_REVIEW_ITEM).count() > 0:
-            return True
+        """
+        Make sure the Reviews tab is open and its card list is loaded.
 
-        # Wait for one of the known signals.
+        Important: preview review cards (`SEL_REVIEW_ITEM`) exist on the
+        place page *before* the Reviews tab is clicked. So we cannot use
+        them alone to decide the tab is open. We require a place-card
+        <h1> and either an already-active Reviews tab or a successful
+        click on it.
+        """
+        # ---- Step 1: wait for a real page signal --------------------
         signals = [
-            "h1",                         # place card
-            'div[role="feed"]',           # search results
-            'button[role="tab"]',         # review tab present
-            "div.jftiEf",                 # review cards (already loaded)
+            self.SEL_PLACE_H1,   # place card (preferred)
+            self.SEL_FEED,       # search results list (fallback)
         ]
-
         for _ in range(self.SIGNAL_POLL_MAX_ATTEMPTS):
-            found_signal: Optional[str] = None
             for sel in signals:
                 try:
                     if await page.locator(sel).count() > 0:
-                        found_signal = sel
+                        logger.debug(
+                            f"[{cafe.id}] Page signal found: {sel}"
+                        )
                         break
                 except Exception:
                     continue
-            if found_signal is not None:
-                logger.debug(
-                    f"[{cafe.id}] Signal found: {found_signal}"
-                )
-                break
-            await page.wait_for_timeout(self.SIGNAL_POLL_INTERVAL_MS)
+            else:
+                await page.wait_for_timeout(self.SIGNAL_POLL_INTERVAL_MS)
+                continue
+            break
 
-        # If we have a place card, click the Reviews tab.
-        if await page.locator("h1").count() > 0:
-            review_tab = page.locator(
-                'button[role="tab"]:has-text("Reviews"), '
-                'button[role="tab"]:has-text("نظرات"), '
-                'button[aria-label*="Reviews for" i]'
-            ).first
-            if (
-                await review_tab.count() > 0
-                and await review_tab.is_visible()
-            ):
-                await review_tab.click()
-                logger.debug(f"[{cafe.id}] Clicked Reviews tab.")
+        # ---- Step 2a: we are on a place page ------------------------
+        if await page.locator(self.SEL_PLACE_H1).count() > 0:
+            clicked = await self._click_reviews_tab(page, cafe)
+            if not clicked:
+                # Sometimes the place page needs a moment before the tab
+                # becomes clickable. Retry once.
                 await page.wait_for_timeout(
                     self.POST_TAB_CLICK_SETTLE_MS
                 )
+                clicked = await self._click_reviews_tab(page, cafe)
 
-        # If we have a search feed, click the first result.
-        elif await page.locator('div[role="feed"]').count() > 0:
-            first_link = page.locator(
-                'div[role="feed"] a[href*="/maps/place/"], a.hfpxzc'
-            ).first
-            if await first_link.count() > 0:
-                await first_link.click()
-                logger.debug(f"[{cafe.id}] Clicked first result.")
-                await page.wait_for_timeout(
-                    self.POST_FIRST_RESULT_SETTLE_MS
+            if not clicked:
+                logger.warning(
+                    f"[{cafe.id}] Place page detected but Reviews tab "
+                    f"could not be clicked."
                 )
-                review_tab = page.locator(
-                    'button[role="tab"]:has-text("Reviews"), '
-                    'button[role="tab"]:has-text("نظرات")'
-                ).first
-                if await review_tab.count() > 0:
-                    await review_tab.click()
-                    await page.wait_for_timeout(
-                        self.POST_TAB_CLICK_SETTLE_MS
-                    )
+                return False
 
-        # Confirm review cards are present.
-        for _ in range(5):
-            if await page.locator(self.SEL_REVIEW_ITEM).count() > 0:
+            # Confirm we now have real review cards (not previews).
+            return await self._wait_for_review_cards(page, cafe)
+
+        # ---- Step 2b: we are on a results list ----------------------
+        if await page.locator(self.SEL_FEED).count() > 0:
+            logger.debug(
+                f"[{cafe.id}] Results list detected — clicking first result."
+            )
+            first_link = page.locator(self.SEL_FIRST_RESULT).first
+            if await first_link.count() > 0:
+                try:
+                    await first_link.click()
+                    await page.wait_for_timeout(
+                        self.POST_FIRST_RESULT_SETTLE_MS
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        f"[{cafe.id}] First result click failed: {exc}"
+                    )
+                    return False
+
+                if await page.locator(self.SEL_PLACE_H1).count() > 0:
+                    clicked = await self._click_reviews_tab(page, cafe)
+                    if clicked:
+                        return await self._wait_for_review_cards(
+                            page, cafe
+                        )
+
+        logger.warning(
+            f"[{cafe.id}] No place page and no results list after "
+            f"waiting — nothing to scrape."
+        )
+        return False
+
+    async def _click_reviews_tab(
+        self, page: Page, cafe: CafeRecord
+    ) -> bool:
+        """Click the Reviews tab if it is not already active. Returns True
+        when the tab is (or becomes) the active tab."""
+        tab = page.locator(self.SEL_REVIEWS_TAB).first
+        if await tab.count() == 0:
+            return False
+
+        # `aria-selected="true"` means the tab is already active.
+        try:
+            selected = await tab.get_attribute("aria-selected")
+        except Exception:
+            selected = None
+        if selected == "true":
+            logger.debug(f"[{cafe.id}] Reviews tab already active.")
+            return True
+
+        if not await tab.is_visible():
+            logger.debug(f"[{cafe.id}] Reviews tab not visible yet.")
+            return False
+
+        try:
+            await tab.click()
+            logger.debug(f"[{cafe.id}] Clicked Reviews tab.")
+            await page.wait_for_timeout(self.POST_TAB_CLICK_SETTLE_MS)
+            return True
+        except Exception as exc:
+            logger.debug(f"[{cafe.id}] Reviews tab click failed: {exc}")
+            return False
+
+    async def _wait_for_review_cards(
+        self, page: Page, cafe: CafeRecord
+    ) -> bool:
+        """Wait until the review feed is rendered with its scroll container."""
+        for _ in range(self.SIGNAL_POLL_MAX_ATTEMPTS):
+            try:
+                count = await self._count_review_cards(page)
+            except Exception:
+                count = 0
+            if count > 0:
+                logger.debug(
+                    f"[{cafe.id}] Review feed ready: {count} cards."
+                )
                 return True
             await page.wait_for_timeout(self.SIGNAL_POLL_INTERVAL_MS)
-
-        # Fallback: click the rating summary.
-        rating_btn = page.locator(
-            'button[aria-label*="reviews" i], '
-            'button[aria-label*="نظرات" i]'
-        ).first
-        if await rating_btn.count() > 0:
-            try:
-                await rating_btn.click()
-                await page.wait_for_timeout(
-                    self.POST_TAB_CLICK_SETTLE_MS
-                )
-                return (
-                    await page.locator(self.SEL_REVIEW_ITEM).count() > 0
-                )
-            except Exception:
-                pass
-
+        logger.warning(
+            f"[{cafe.id}] Review cards never appeared after clicking tab."
+        )
         return False
+
+    # ------------------------------------------------------------------
+    # Review-item locator helpers
+    # ------------------------------------------------------------------
+    async def _review_item_locator(self, page: Page):
+        """
+        Return a locator for review cards.
+
+        Prefer `div.jftiEf` because it is the card class itself. Only
+        fall back to `div[data-review-id]` when no `jftiEf` element is
+        present — on some UI variants the wrapper also carries
+        `data-review-id`, so matching both via a comma-selector would
+        count every review twice.
+        """
+        primary = page.locator(self.SEL_REVIEW_ITEM)
+        if await primary.count() > 0:
+            return primary
+        return page.locator(self.SEL_REVIEW_ITEM_FALLBACK)
+
+    async def _count_review_cards(self, page: Page) -> int:
+        """Convenience wrapper — one await instead of two."""
+        locator = await self._review_item_locator(page)
+        return await locator.count()
 
     # ------------------------------------------------------------------
     # Scrolling & expansion
@@ -442,9 +528,7 @@ class GoogleMapsScraper:
                     self.SCROLL_SLEEP_MIN, self.SCROLL_SLEEP_MAX
                 )
             )
-            current_count = await page.locator(
-                self.SEL_REVIEW_ITEM
-            ).count()
+            current_count = await self._count_review_cards(page)
 
             if current_count >= self.max_reviews:
                 logger.debug(
@@ -461,17 +545,44 @@ class GoogleMapsScraper:
                 last_count = current_count
 
     async def _expand_all_more_buttons(self, page: Page) -> None:
-        buttons = page.locator(self.SEL_MORE_BUTTON)
-        count = await buttons.count()
-        limit = min(count, self.max_reviews)
-        for i in range(limit):
-            try:
-                await buttons.nth(i).click(
-                    timeout=self.MORE_BUTTON_CLICK_TIMEOUT_MS
-                )
-                await asyncio.sleep(0.05)
-            except Exception:
-                continue
+        """
+        Click every 'More' button in the review feed in a single JS
+        round-trip.
+
+        The previous implementation called `.click()` once per button
+        through Playwright, which costs ~50-100ms per button and could
+        take up to 2 minutes for 150 reviews. A single page.evaluate()
+        collapses that to a few hundred milliseconds.
+        """
+        selectors = [
+            "button.w8nwRe.kyuRq",
+            'button[aria-label*="More" i]',
+            'button[aria-label*="بیشتر" i]',
+        ]
+        try:
+            clicked = await page.evaluate(
+                """(sels) => {
+                    const btns = document.querySelectorAll(sels.join(','));
+                    let n = 0;
+                    for (const b of btns) {
+                        try {
+                            b.scrollIntoView({block: 'nearest'});
+                            b.click();
+                            n++;
+                        } catch (e) {}
+                    }
+                    return n;
+                }""",
+                selectors,
+            )
+            logger.debug(
+                f"Expanded {clicked} 'More' buttons in one pass."
+            )
+        except Exception as exc:
+            logger.debug(f"Batch 'More' click failed: {exc}")
+
+        # Give the DOM a moment to swap truncated text with full text.
+        await page.wait_for_timeout(self.POST_MORE_EXPAND_SETTLE_MS)
 
     # ------------------------------------------------------------------
     # Extraction
@@ -479,7 +590,7 @@ class GoogleMapsScraper:
     async def _extract_reviews(
         self, page: Page, cafe: CafeRecord
     ) -> list[ReviewRecord]:
-        items = page.locator(self.SEL_REVIEW_ITEM)
+        items = await self._review_item_locator(page)
         total = min(await items.count(), self.max_reviews)
         records: list[ReviewRecord] = []
         seen: set[tuple[str, str, str]] = set()  # (author, date, text)
