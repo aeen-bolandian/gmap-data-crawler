@@ -75,3 +75,5 @@ secrets.json
 Thumbs.db
 desktop.inirecovered.sql
 *.sql
+recovered.sql
+*.sql
