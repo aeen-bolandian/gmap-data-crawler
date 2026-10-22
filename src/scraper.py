@@ -14,8 +14,6 @@ Strategy
 
 from __future__ import annotations
 
-import asyncio
-import random
 from dataclasses import dataclass
 from typing import Optional
 
@@ -115,11 +113,17 @@ class GoogleMapsScraper:
     POST_MORE_EXPAND_SETTLE_MS = 300
     SIGNAL_POLL_INTERVAL_MS = 1_000
     SIGNAL_POLL_MAX_ATTEMPTS = 20
+
+    # --- Scroll tuning (event-driven) -----------------------------------
     SCROLL_STEP_PX = 3_000
     WINDOW_SCROLL_STEP_PX = 1_500
     SCROLL_MAX_ITERATIONS = 25
-    SCROLL_SLEEP_MIN = 1.5
-    SCROLL_SLEEP_MAX = 2.5
+    # Max time to wait for ONE new review card after a scroll step.
+    # If a new card shows up faster, we continue immediately.
+    SCROLL_WAIT_FOR_NEW_CARD_MS = 2_500
+    # Stop after N consecutive scrolls that produce no new cards.
+    SCROLL_MAX_STAGNANT = 3
+
     MORE_BUTTON_CLICK_TIMEOUT_MS = 800
 
     # --- Consent selectors (in case the user's session was not accepted) ---
@@ -498,6 +502,16 @@ class GoogleMapsScraper:
     # Scrolling & expansion
     # ------------------------------------------------------------------
     async def _scroll_reviews_container(self, page: Page) -> None:
+        """
+        Scroll the reviews pane until either the review cap is reached
+        or no new cards appear after a few scroll attempts.
+
+        Unlike the v1.0.0 implementation, this does NOT sleep for a
+        fixed 1.5-2.5s after each scroll. Instead it waits up to
+        SCROLL_WAIT_FOR_NEW_CARD_MS for a new review card to appear,
+        returning immediately when one does. On fast loads this cuts
+        the scroll phase from ~60s to ~15s for a 150-review cafe.
+        """
         last_count = 0
         stagnant = 0
 
@@ -523,26 +537,36 @@ class GoogleMapsScraper:
                 self.SCROLL_STEP_PX,
             )
 
-            await asyncio.sleep(
-                random.uniform(
-                    self.SCROLL_SLEEP_MIN, self.SCROLL_SLEEP_MAX
+            # Wait for at least one NEW card to appear (event-driven).
+            try:
+                await page.wait_for_function(
+                    """(prev) => {
+                        return document.querySelectorAll(
+                            'div.jftiEf, div[data-review-id]'
+                        ).length > prev;
+                    }""",
+                    arg=last_count,
+                    timeout=self.SCROLL_WAIT_FOR_NEW_CARD_MS,
                 )
-            )
-            current_count = await self._count_review_cards(page)
+            except Exception:
+                # Timeout — no new cards after this scroll step.
+                stagnant += 1
+                if stagnant >= self.SCROLL_MAX_STAGNANT:
+                    logger.debug(
+                        f"Scroll stalled after {stagnant} attempts."
+                    )
+                    break
+                continue
 
+            current_count = await self._count_review_cards(page)
             if current_count >= self.max_reviews:
                 logger.debug(
                     f"Reached review cap ({self.max_reviews})."
                 )
                 break
 
-            if current_count == last_count:
-                stagnant += 1
-                if stagnant >= 3:
-                    break
-            else:
-                stagnant = 0
-                last_count = current_count
+            stagnant = 0
+            last_count = current_count
 
     async def _expand_all_more_buttons(self, page: Page) -> None:
         """
