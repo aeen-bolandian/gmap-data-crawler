@@ -10,10 +10,17 @@ Strategy
   "Limited View" mode for anonymous visitors).
 - Fall back to a fresh tab / new browser only when no session is available.
 - Never close a tab we did not create ourselves.
+- VALIDATE that the opened place matches the cafe in the database
+  (by coordinates, falling back to name) before extracting reviews.
+  This prevents storing reviews of a different cafe when the ?q=
+  query is ambiguous.
 """
 
 from __future__ import annotations
 
+import math
+import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Optional
 
@@ -58,6 +65,103 @@ class ReviewRecord:
 
 
 # ---------------------------------------------------------------------------
+# Geo helpers
+# ---------------------------------------------------------------------------
+# Matches Google Maps' `/@LAT,LNG,ZOOMz` URL fragment.
+_COORD_RE = re.compile(r"/@(-?\d+\.\d+),(-?\d+\.\d+)")
+
+# Max distance (meters) between DB coords and URL coords to consider
+# the opened place a match for the cafe record.
+MAX_MATCH_DISTANCE_M = 100.0
+
+
+def haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """Great-circle distance in meters between two lat/lng points."""
+    R = 6_371_000.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlmb = math.radians(lng2 - lng1)
+    a = (
+        math.sin(dphi / 2.0) ** 2
+        + math.cos(phi1) * math.cos(phi2) * math.sin(dlmb / 2.0) ** 2
+    )
+    return 2.0 * R * math.asin(math.sqrt(a))
+
+
+def extract_coords_from_url(url: str) -> Optional[tuple[float, float]]:
+    """Pull (lat, lng) out of a Google Maps place URL, if present."""
+    m = _COORD_RE.search(url)
+    if not m:
+        return None
+    try:
+        return float(m.group(1)), float(m.group(2))
+    except ValueError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Name normalization (fallback when URL has no coords)
+# ---------------------------------------------------------------------------
+# Common cafe/restaurant prefixes that add noise to matching.
+_STRIP_TOKENS = (
+    "cafe", "کافه", "coffee", "restaurant", "رستوران", "کافهرستوران",
+    "کافه رستوران", "کافې", "کافە",
+)
+
+
+def _normalize_name(name: str) -> str:
+    """
+    Normalize a place name for comparison:
+    - Unicode NFKC (collapse ﬁ → fi, etc.)
+    - Lowercase
+    - Convert Arabic ي/ك to Persian ی/ک
+    - Remove diacritics (U+064B..U+065F, U+0670)
+    - Replace ZWNJ/ZWJ with space
+    - Strip common cafe/restaurant tokens
+    - Collapse whitespace
+    """
+    if not name:
+        return ""
+    s = unicodedata.normalize("NFKC", name)
+    s = s.lower()
+    s = s.replace("\u064A", "\u06CC")  # ي -> ی
+    s = s.replace("\u0643", "\u06A9")  # ك -> ک
+    # Remove Arabic diacritics
+    s = re.sub(r"[\u064B-\u065F\u0670]", "", s)
+    # ZWNJ/ZWJ -> space
+    s = s.replace("\u200C", " ").replace("\u200D", " ")
+    # Strip leading/trailing cafe/restaurant tokens
+    for tok in _STRIP_TOKENS:
+        s = s.strip()
+        if s.startswith(tok + " "):
+            s = s[len(tok) + 1 :]
+        if s.endswith(" " + tok):
+            s = s[: -len(tok) - 1]
+    # Collapse whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def names_look_same(a: str, b: str) -> bool:
+    """
+    Loose name-match used only as a fallback when coordinates are
+    missing from the URL. Returns True only when the shorter string is
+    at least 5 chars and is fully contained in the longer one.
+    """
+    na = _normalize_name(a)
+    nb = _normalize_name(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    shorter, longer = sorted((na, nb), key=len)
+    if len(shorter) < 5:
+        return False
+    return shorter in longer
+
+
+# ---------------------------------------------------------------------------
 # Scraper
 # ---------------------------------------------------------------------------
 class GoogleMapsScraper:
@@ -87,11 +191,7 @@ class GoogleMapsScraper:
     # Text: scoped to the visible review body.
     SEL_TEXT = "span.wiI7pd"
 
-    # --- Place-page detection --------------------------------------------
-    # A "real" place page always has an <h1> and a Reviews tab. The
-    # preview cards that appear before opening the Reviews tab also
-    # match SEL_REVIEW_ITEM, so we cannot use that alone to decide
-    # whether the place page is ready.
+    # --- Page-type detection --------------------------------------------
     SEL_PLACE_H1 = "h1"
     SEL_PLACE_TAB = 'button[role="tab"]'
     SEL_REVIEWS_TAB = (
@@ -101,11 +201,15 @@ class GoogleMapsScraper:
         'button[aria-label*="نظرات" i]'
     )
     SEL_FEED = 'div[role="feed"]'
-    SEL_FIRST_RESULT = 'div[role="feed"] a[href*="/maps/place/"], a.hfpxzc'
+    # Results are sometimes a plain list of `/maps/place/` links instead
+    # of a `div[role="feed"]` (Google serves multiple layouts).
+    SEL_RESULT_LINK = 'a[href*="/maps/place/"]'
+    SEL_FIRST_RESULT = (
+        'div[role="feed"] a[href*="/maps/place/"], a.hfpxzc, '
+        + SEL_RESULT_LINK
+    )
 
     # --- Timing configuration -------------------------------------------
-    # Centralized here so later perf optimizations only touch numbers,
-    # not control flow. Values match the v1.0.0 hardcoded defaults.
     PAGE_LOAD_TIMEOUT_MS = 60_000
     POST_GOTO_SETTLE_MS = 5_000
     POST_TAB_CLICK_SETTLE_MS = 2_000
@@ -118,10 +222,7 @@ class GoogleMapsScraper:
     SCROLL_STEP_PX = 3_000
     WINDOW_SCROLL_STEP_PX = 1_500
     SCROLL_MAX_ITERATIONS = 25
-    # Max time to wait for ONE new review card after a scroll step.
-    # If a new card shows up faster, we continue immediately.
     SCROLL_WAIT_FOR_NEW_CARD_MS = 2_500
-    # Stop after N consecutive scrolls that produce no new cards.
     SCROLL_MAX_STAGNANT = 3
 
     MORE_BUTTON_CLICK_TIMEOUT_MS = 800
@@ -174,7 +275,6 @@ class GoogleMapsScraper:
 
             self._owns_browser = False
 
-            # Pick the most useful existing tab to reuse.
             self._existing_page = self._pick_existing_page()
             if self._existing_page is not None:
                 logger.info(
@@ -205,8 +305,6 @@ class GoogleMapsScraper:
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
-        # Only close the browser if we launched it; a CDP browser belongs
-        # to the user and must survive our shutdown.
         if self._owns_browser and self._browser is not None:
             try:
                 await self._browser.close()
@@ -222,7 +320,6 @@ class GoogleMapsScraper:
     async def scrape(self, target: ResolvedTarget) -> list[ReviewRecord]:
         assert self._context is not None
 
-        # Reuse the existing (logged-in) tab if possible.
         reused = (
             self._existing_page is not None
             and not self._existing_page.is_closed()
@@ -243,16 +340,20 @@ class GoogleMapsScraper:
                 timeout=self.PAGE_LOAD_TIMEOUT_MS,
                 wait_until="domcontentloaded",
             )
-            # Give Google Maps JS a moment to hydrate.
             await page.wait_for_timeout(self.POST_GOTO_SETTLE_MS)
 
-            # Handle a consent page if it appears mid-flight.
             await self._handle_consent(page, target.cafe)
 
             if not await self._open_reviews_tab(page, target.cafe):
                 logger.warning(
-                    f"[{target.cafe.id}] Could not switch to Reviews tab."
+                    f"[{target.cafe.id}] Could not open Reviews tab or "
+                    f"place did not match — skipping."
                 )
+                return []
+
+            # ---- Validate that this is the right place ---------------
+            if not await self._validate_place_match(page, target.cafe):
+                # _validate_place_match already logged the reason.
                 return []
 
             logger.info(
@@ -273,7 +374,6 @@ class GoogleMapsScraper:
             logger.exception(f"[{target.cafe.id}] Unexpected failure: {exc}")
             return []
         finally:
-            # Never close the tab the user gave us.
             if page is not self._existing_page:
                 try:
                     await page.close()
@@ -284,20 +384,10 @@ class GoogleMapsScraper:
     # Tab selection & consent
     # ------------------------------------------------------------------
     def _pick_existing_page(self) -> Optional[Page]:
-        """
-        Pick the best existing tab to reuse.
-
-        Preference order:
-        1. A tab already on google.com/maps with a place card loaded.
-        2. A tab already on google.com/maps.
-        3. The first non-blank tab.
-        """
         if not self._context or not self._context.pages:
             return None
 
         pages = list(self._context.pages)
-
-        # Skip obviously useless tabs (about:blank, chrome://, etc.).
         candidates = [
             p
             for p in pages
@@ -308,7 +398,6 @@ class GoogleMapsScraper:
         if not candidates:
             return None
 
-        # Prefer a Maps tab.
         maps_tabs = [
             p for p in candidates if "google.com/maps" in p.url
         ]
@@ -318,7 +407,6 @@ class GoogleMapsScraper:
         return candidates[0]
 
     async def _handle_consent(self, page: Page, cafe: CafeRecord) -> None:
-        """Dismiss Google's consent banner if it appeared."""
         try:
             if "consent.google.com" not in page.url:
                 return
@@ -338,7 +426,7 @@ class GoogleMapsScraper:
             logger.debug(f"[{cafe.id}] Consent handler warning: {exc}")
 
     # ------------------------------------------------------------------
-    # Reviews tab discovery
+    # Reviews tab discovery (with strict page-type detection)
     # ------------------------------------------------------------------
     async def _open_reviews_tab(
         self, page: Page, cafe: CafeRecord
@@ -346,38 +434,42 @@ class GoogleMapsScraper:
         """
         Make sure the Reviews tab is open and its card list is loaded.
 
-        Important: preview review cards (`SEL_REVIEW_ITEM`) exist on the
-        place page *before* the Reviews tab is clicked. So we cannot use
-        them alone to decide the tab is open. We require a place-card
-        <h1> and either an already-active Reviews tab or a successful
-        click on it.
-        """
-        # ---- Step 1: wait for a real page signal --------------------
-        signals = [
-            self.SEL_PLACE_H1,   # place card (preferred)
-            self.SEL_FEED,       # search results list (fallback)
-        ]
-        for _ in range(self.SIGNAL_POLL_MAX_ATTEMPTS):
-            for sel in signals:
-                try:
-                    if await page.locator(sel).count() > 0:
-                        logger.debug(
-                            f"[{cafe.id}] Page signal found: {sel}"
-                        )
-                        break
-                except Exception:
-                    continue
-            else:
-                await page.wait_for_timeout(self.SIGNAL_POLL_INTERVAL_MS)
-                continue
-            break
+        Detection is based on DOM signals, not URL heuristics:
+        - A `button[role="tab"]` means we are on a place page.
+        - A `/maps/place/` link (or `div[role="feed"]`) means we are on
+          a results list.
 
-        # ---- Step 2a: we are on a place page ------------------------
-        if await page.locator(self.SEL_PLACE_H1).count() > 0:
+        We only click into the first result when a results list is
+        detected; the subsequent _validate_place_match() call decides
+        whether the opened place is actually the requested cafe.
+        """
+        # ---- Step 1: wait for a definitive page signal --------------
+        signal: Optional[str] = None
+        for _ in range(self.SIGNAL_POLL_MAX_ATTEMPTS):
+            if await page.locator(self.SEL_PLACE_TAB).count() > 0:
+                signal = "tabs"
+                break
+            if await page.locator(self.SEL_FEED).count() > 0:
+                signal = "feed"
+                break
+            if await page.locator(self.SEL_RESULT_LINK).count() > 0:
+                signal = "place_links"
+                break
+            await page.wait_for_timeout(self.SIGNAL_POLL_INTERVAL_MS)
+
+        if signal is None:
+            logger.warning(
+                f"[{cafe.id}] No place tab, feed, or result links after "
+                f"waiting — cannot determine page type."
+            )
+            return False
+
+        logger.debug(f"[{cafe.id}] Page signal: {signal}")
+
+        # ---- Step 2a: place page ------------------------------------
+        if signal == "tabs":
             clicked = await self._click_reviews_tab(page, cafe)
             if not clicked:
-                # Sometimes the place page needs a moment before the tab
-                # becomes clickable. Retry once.
                 await page.wait_for_timeout(
                     self.POST_TAB_CLICK_SETTLE_MS
                 )
@@ -390,50 +482,53 @@ class GoogleMapsScraper:
                 )
                 return False
 
-            # Confirm we now have real review cards (not previews).
             return await self._wait_for_review_cards(page, cafe)
 
-        # ---- Step 2b: we are on a results list ----------------------
-        if await page.locator(self.SEL_FEED).count() > 0:
-            logger.debug(
-                f"[{cafe.id}] Results list detected — clicking first result."
+        # ---- Step 2b: results list ----------------------------------
+        first_link = page.locator(self.SEL_FIRST_RESULT).first
+        if await first_link.count() == 0:
+            logger.warning(
+                f"[{cafe.id}] Results list detected but no clickable "
+                f"result link found."
             )
-            first_link = page.locator(self.SEL_FIRST_RESULT).first
-            if await first_link.count() > 0:
-                try:
-                    await first_link.click()
-                    await page.wait_for_timeout(
-                        self.POST_FIRST_RESULT_SETTLE_MS
-                    )
-                except Exception as exc:
-                    logger.debug(
-                        f"[{cafe.id}] First result click failed: {exc}"
-                    )
-                    return False
+            return False
 
-                if await page.locator(self.SEL_PLACE_H1).count() > 0:
-                    clicked = await self._click_reviews_tab(page, cafe)
-                    if clicked:
-                        return await self._wait_for_review_cards(
-                            page, cafe
-                        )
+        try:
+            await first_link.click()
+            await page.wait_for_timeout(
+                self.POST_FIRST_RESULT_SETTLE_MS
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[{cafe.id}] Failed to click first result: {exc}"
+            )
+            return False
 
-        logger.warning(
-            f"[{cafe.id}] No place page and no results list after "
-            f"waiting — nothing to scrape."
-        )
-        return False
+        # After clicking, the page should now be a place page.
+        if await page.locator(self.SEL_PLACE_TAB).count() == 0:
+            logger.warning(
+                f"[{cafe.id}] After clicking first result, no place "
+                f"tab appeared."
+            )
+            return False
+
+        clicked = await self._click_reviews_tab(page, cafe)
+        if not clicked:
+            logger.warning(
+                f"[{cafe.id}] Reviews tab could not be clicked after "
+                f"navigating to first result."
+            )
+            return False
+
+        return await self._wait_for_review_cards(page, cafe)
 
     async def _click_reviews_tab(
         self, page: Page, cafe: CafeRecord
     ) -> bool:
-        """Click the Reviews tab if it is not already active. Returns True
-        when the tab is (or becomes) the active tab."""
         tab = page.locator(self.SEL_REVIEWS_TAB).first
         if await tab.count() == 0:
             return False
 
-        # `aria-selected="true"` means the tab is already active.
         try:
             selected = await tab.get_attribute("aria-selected")
         except Exception:
@@ -458,7 +553,6 @@ class GoogleMapsScraper:
     async def _wait_for_review_cards(
         self, page: Page, cafe: CafeRecord
     ) -> bool:
-        """Wait until the review feed is rendered with its scroll container."""
         for _ in range(self.SIGNAL_POLL_MAX_ATTEMPTS):
             try:
                 count = await self._count_review_cards(page)
@@ -476,25 +570,85 @@ class GoogleMapsScraper:
         return False
 
     # ------------------------------------------------------------------
+    # Place validation (STRICT — must match DB by coords or name)
+    # ------------------------------------------------------------------
+    async def _validate_place_match(
+        self, page: Page, cafe: CafeRecord
+    ) -> bool:
+        """
+        Verify that the currently-open place page is the cafe record.
+
+        Primary check: compare URL coordinates against DB coordinates.
+        A match requires distance <= MAX_MATCH_DISTANCE_M (100m).
+
+        Fallback (only when URL has no coordinates): compare normalized
+        names. This is rare — practically every Google Maps place URL
+        carries `/@LAT,LNG,Zz`.
+
+        Returns False (and logs a warning) on mismatch, so the caller
+        skips extraction instead of storing wrong-cafe reviews.
+        """
+        current_url = page.url
+        coords = extract_coords_from_url(current_url)
+
+        # ---- Primary: coordinate-based match ------------------------
+        if (
+            coords is not None
+            and cafe.latitude is not None
+            and cafe.longitude is not None
+        ):
+            url_lat, url_lng = coords
+            dist = haversine_m(
+                cafe.latitude, cafe.longitude, url_lat, url_lng
+            )
+            if dist <= MAX_MATCH_DISTANCE_M:
+                logger.debug(
+                    f"[{cafe.id}] Place matched by coords "
+                    f"(dist={dist:.1f}m)."
+                )
+                return True
+            logger.warning(
+                f"[{cafe.id}] Place does NOT match cafe coords: "
+                f"db=({cafe.latitude:.5f},{cafe.longitude:.5f}) "
+                f"page=({url_lat:.5f},{url_lng:.5f}) "
+                f"dist={dist:.1f}m > {MAX_MATCH_DISTANCE_M}m. "
+                f"Skipping to avoid storing wrong reviews."
+            )
+            return False
+
+        # ---- Fallback: name-based match ----------------------------
+        page_name = ""
+        try:
+            h1 = page.locator(self.SEL_PLACE_H1).first
+            if await h1.count() > 0:
+                page_name = (await h1.inner_text()).strip()
+        except Exception:
+            pass
+
+        if page_name and names_look_same(cafe.name, page_name):
+            logger.debug(
+                f"[{cafe.id}] Place matched by name fallback: "
+                f"db={cafe.name!r} page={page_name!r}"
+            )
+            return True
+
+        logger.warning(
+            f"[{cafe.id}] Place does NOT match (no coords in URL, "
+            f"name mismatch): db={cafe.name!r} page={page_name!r}. "
+            f"Skipping."
+        )
+        return False
+
+    # ------------------------------------------------------------------
     # Review-item locator helpers
     # ------------------------------------------------------------------
     async def _review_item_locator(self, page: Page):
-        """
-        Return a locator for review cards.
-
-        Prefer `div.jftiEf` because it is the card class itself. Only
-        fall back to `div[data-review-id]` when no `jftiEf` element is
-        present — on some UI variants the wrapper also carries
-        `data-review-id`, so matching both via a comma-selector would
-        count every review twice.
-        """
         primary = page.locator(self.SEL_REVIEW_ITEM)
         if await primary.count() > 0:
             return primary
         return page.locator(self.SEL_REVIEW_ITEM_FALLBACK)
 
     async def _count_review_cards(self, page: Page) -> int:
-        """Convenience wrapper — one await instead of two."""
         locator = await self._review_item_locator(page)
         return await locator.count()
 
@@ -502,22 +656,10 @@ class GoogleMapsScraper:
     # Scrolling & expansion
     # ------------------------------------------------------------------
     async def _scroll_reviews_container(self, page: Page) -> None:
-        """
-        Scroll the reviews pane until either the review cap is reached
-        or no new cards appear after a few scroll attempts.
-
-        Unlike the v1.0.0 implementation, this does NOT sleep for a
-        fixed 1.5-2.5s after each scroll. Instead it waits up to
-        SCROLL_WAIT_FOR_NEW_CARD_MS for a new review card to appear,
-        returning immediately when one does. On fast loads this cuts
-        the scroll phase from ~60s to ~15s for a 150-review cafe.
-        """
         last_count = 0
         stagnant = 0
 
         for _ in range(self.SCROLL_MAX_ITERATIONS):
-            # Walk up to the first ancestor that actually overflows; this
-            # avoids the brittle `div.m6QErb` class dependency.
             await page.evaluate(
                 """(step) => {
                     const card = document.querySelector(
@@ -537,7 +679,6 @@ class GoogleMapsScraper:
                 self.SCROLL_STEP_PX,
             )
 
-            # Wait for at least one NEW card to appear (event-driven).
             try:
                 await page.wait_for_function(
                     """(prev) => {
@@ -549,7 +690,6 @@ class GoogleMapsScraper:
                     timeout=self.SCROLL_WAIT_FOR_NEW_CARD_MS,
                 )
             except Exception:
-                # Timeout — no new cards after this scroll step.
                 stagnant += 1
                 if stagnant >= self.SCROLL_MAX_STAGNANT:
                     logger.debug(
@@ -569,15 +709,6 @@ class GoogleMapsScraper:
             last_count = current_count
 
     async def _expand_all_more_buttons(self, page: Page) -> None:
-        """
-        Click every 'More' button in the review feed in a single JS
-        round-trip.
-
-        The previous implementation called `.click()` once per button
-        through Playwright, which costs ~50-100ms per button and could
-        take up to 2 minutes for 150 reviews. A single page.evaluate()
-        collapses that to a few hundred milliseconds.
-        """
         selectors = [
             "button.w8nwRe.kyuRq",
             'button[aria-label*="More" i]',
@@ -605,7 +736,6 @@ class GoogleMapsScraper:
         except Exception as exc:
             logger.debug(f"Batch 'More' click failed: {exc}")
 
-        # Give the DOM a moment to swap truncated text with full text.
         await page.wait_for_timeout(self.POST_MORE_EXPAND_SETTLE_MS)
 
     # ------------------------------------------------------------------
@@ -617,7 +747,7 @@ class GoogleMapsScraper:
         items = await self._review_item_locator(page)
         total = min(await items.count(), self.max_reviews)
         records: list[ReviewRecord] = []
-        seen: set[tuple[str, str, str]] = set()  # (author, date, text)
+        seen: set[tuple[str, str, str]] = set()
 
         for i in range(total):
             item = items.nth(i)
