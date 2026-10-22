@@ -73,4 +73,5 @@ secrets.json
 .playwright/
 .DS_Store
 Thumbs.db
-desktop.ini
+desktop.inirecovered.sql
+*.sql
