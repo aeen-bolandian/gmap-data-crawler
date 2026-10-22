@@ -84,6 +84,22 @@ class GoogleMapsScraper:
     # Text: scoped to the visible review body.
     SEL_TEXT = "span.wiI7pd"
 
+    # --- Timing configuration -------------------------------------------
+    # Centralized here so later perf optimizations only touch numbers,
+    # not control flow. Values match the v1.0.0 hardcoded defaults.
+    PAGE_LOAD_TIMEOUT_MS = 60_000
+    POST_GOTO_SETTLE_MS = 5_000
+    POST_TAB_CLICK_SETTLE_MS = 2_000
+    POST_FIRST_RESULT_SETTLE_MS = 3_000
+    SIGNAL_POLL_INTERVAL_MS = 1_000
+    SIGNAL_POLL_MAX_ATTEMPTS = 20
+    SCROLL_STEP_PX = 3_000
+    WINDOW_SCROLL_STEP_PX = 1_500
+    SCROLL_MAX_ITERATIONS = 25
+    SCROLL_SLEEP_MIN = 1.5
+    SCROLL_SLEEP_MAX = 2.5
+    MORE_BUTTON_CLICK_TIMEOUT_MS = 800
+
     # --- Consent selectors (in case the user's session was not accepted) ---
     CONSENT_SELECTORS = (
         'button:has-text("Accept all")',
@@ -197,10 +213,12 @@ class GoogleMapsScraper:
             await page.bring_to_front()
             logger.debug(f"[{target.cafe.id}] Opening URL: {target.url}")
             await page.goto(
-                target.url, timeout=60_000, wait_until="domcontentloaded"
+                target.url,
+                timeout=self.PAGE_LOAD_TIMEOUT_MS,
+                wait_until="domcontentloaded",
             )
             # Give Google Maps JS a moment to hydrate.
-            await page.wait_for_timeout(5_000)
+            await page.wait_for_timeout(self.POST_GOTO_SETTLE_MS)
 
             # Handle a consent page if it appears mid-flight.
             await self._handle_consent(page, target.cafe)
@@ -286,7 +304,9 @@ class GoogleMapsScraper:
                 if await btn.count() > 0 and await btn.is_visible():
                     await btn.click()
                     logger.debug(f"[{cafe.id}] Clicked: {sel}")
-                    await page.wait_for_timeout(2_000)
+                    await page.wait_for_timeout(
+                        self.POST_TAB_CLICK_SETTLE_MS
+                    )
                     return
         except Exception as exc:
             logger.debug(f"[{cafe.id}] Consent handler warning: {exc}")
@@ -309,7 +329,7 @@ class GoogleMapsScraper:
             "div.jftiEf",                 # review cards (already loaded)
         ]
 
-        for _ in range(20):
+        for _ in range(self.SIGNAL_POLL_MAX_ATTEMPTS):
             found_signal: Optional[str] = None
             for sel in signals:
                 try:
@@ -323,7 +343,7 @@ class GoogleMapsScraper:
                     f"[{cafe.id}] Signal found: {found_signal}"
                 )
                 break
-            await page.wait_for_timeout(1_000)
+            await page.wait_for_timeout(self.SIGNAL_POLL_INTERVAL_MS)
 
         # If we have a place card, click the Reviews tab.
         if await page.locator("h1").count() > 0:
@@ -338,7 +358,9 @@ class GoogleMapsScraper:
             ):
                 await review_tab.click()
                 logger.debug(f"[{cafe.id}] Clicked Reviews tab.")
-                await page.wait_for_timeout(2_000)
+                await page.wait_for_timeout(
+                    self.POST_TAB_CLICK_SETTLE_MS
+                )
 
         # If we have a search feed, click the first result.
         elif await page.locator('div[role="feed"]').count() > 0:
@@ -348,20 +370,24 @@ class GoogleMapsScraper:
             if await first_link.count() > 0:
                 await first_link.click()
                 logger.debug(f"[{cafe.id}] Clicked first result.")
-                await page.wait_for_timeout(3_000)
+                await page.wait_for_timeout(
+                    self.POST_FIRST_RESULT_SETTLE_MS
+                )
                 review_tab = page.locator(
                     'button[role="tab"]:has-text("Reviews"), '
                     'button[role="tab"]:has-text("نظرات")'
                 ).first
                 if await review_tab.count() > 0:
                     await review_tab.click()
-                    await page.wait_for_timeout(2_000)
+                    await page.wait_for_timeout(
+                        self.POST_TAB_CLICK_SETTLE_MS
+                    )
 
         # Confirm review cards are present.
         for _ in range(5):
             if await page.locator(self.SEL_REVIEW_ITEM).count() > 0:
                 return True
-            await page.wait_for_timeout(1_000)
+            await page.wait_for_timeout(self.SIGNAL_POLL_INTERVAL_MS)
 
         # Fallback: click the rating summary.
         rating_btn = page.locator(
@@ -371,7 +397,9 @@ class GoogleMapsScraper:
         if await rating_btn.count() > 0:
             try:
                 await rating_btn.click()
-                await page.wait_for_timeout(2_000)
+                await page.wait_for_timeout(
+                    self.POST_TAB_CLICK_SETTLE_MS
+                )
                 return (
                     await page.locator(self.SEL_REVIEW_ITEM).count() > 0
                 )
@@ -387,11 +415,11 @@ class GoogleMapsScraper:
         last_count = 0
         stagnant = 0
 
-        for _ in range(25):
+        for _ in range(self.SCROLL_MAX_ITERATIONS):
             # Walk up to the first ancestor that actually overflows; this
             # avoids the brittle `div.m6QErb` class dependency.
             await page.evaluate(
-                """() => {
+                """(step) => {
                     const card = document.querySelector(
                         'div.jftiEf, div[data-review-id]'
                     );
@@ -402,13 +430,18 @@ class GoogleMapsScraper:
                         ) {
                             el = el.parentElement;
                         }
-                        if (el) { el.scrollBy(0, 3000); return; }
+                        if (el) { el.scrollBy(0, step); return; }
                     }
-                    window.scrollBy(0, 1500);
-                }"""
+                    window.scrollBy(0, step);
+                }""",
+                self.SCROLL_STEP_PX,
             )
 
-            await asyncio.sleep(random.uniform(1.5, 2.5))
+            await asyncio.sleep(
+                random.uniform(
+                    self.SCROLL_SLEEP_MIN, self.SCROLL_SLEEP_MAX
+                )
+            )
             current_count = await page.locator(
                 self.SEL_REVIEW_ITEM
             ).count()
@@ -433,7 +466,9 @@ class GoogleMapsScraper:
         limit = min(count, self.max_reviews)
         for i in range(limit):
             try:
-                await buttons.nth(i).click(timeout=800)
+                await buttons.nth(i).click(
+                    timeout=self.MORE_BUTTON_CLICK_TIMEOUT_MS
+                )
                 await asyncio.sleep(0.05)
             except Exception:
                 continue
